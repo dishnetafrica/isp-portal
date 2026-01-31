@@ -1,0 +1,68 @@
+# Dynamic Traefik Configuration
+# Security headers and middlewares
+
+http:
+  middlewares:
+    # Security Headers
+    security-headers:
+      headers:
+        accessControlAllowMethods:
+          - GET
+          - OPTIONS
+          - PUT
+          - POST
+          - DELETE
+        accessControlMaxAge: 100
+        hostsProxyHeaders:
+          - "X-Forwarded-Host"
+        stsSeconds: 63072000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        forceSTSHeader: true
+        frameDeny: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+        referrerPolicy: "origin-when-cross-origin"
+        customFrameOptionsValue: "SAMEORIGIN"
+        customResponseHeaders:
+          X-Robots-Tag: "noindex, nofollow"
+          server: ""
+
+    # Rate Limiting for API
+    api-ratelimit:
+      rateLimit:
+        average: 100
+        burst: 50
+        period: 1m
+
+    # Rate Limiting for Auth endpoints
+    auth-ratelimit:
+      rateLimit:
+        average: 10
+        burst: 5
+        period: 1m
+
+    # IP Whitelist for Admin
+    admin-whitelist:
+      ipWhiteList:
+        sourceRange:
+          - "127.0.0.1/32"
+          # Add your admin IPs here
+          # - "YOUR_OFFICE_IP/32"
+
+    # Compress responses
+    compress:
+      compress: {}
+
+    # Retry on failure
+    retry:
+      retry:
+        attempts: 3
+        initialInterval: 100ms
+
+  # Custom error pages
+  services:
+    error-pages:
+      loadBalancer:
+        servers:
+          - url: "http://backend:8000"

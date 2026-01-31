@@ -1,0 +1,62 @@
+# Development Docker Compose Override
+# Use with: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    volumes:
+      - ./backend:/app
+    environment:
+      - ENVIRONMENT=development
+    ports:
+      - "8000:8000"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    labels:
+      - "traefik.enable=false"
+
+  # Remove SSL requirement for local development
+  traefik:
+    ports:
+      - "80:80"
+      - "8080:8080"  # Dashboard without auth
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+
+  # Adminer for database management
+  adminer:
+    image: adminer
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    networks:
+      - internal
+
+  # Redis Commander for Redis management
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    restart: unless-stopped
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    ports:
+      - "8082:8081"
+    networks:
+      - internal
+
+  # Mongo Express for MongoDB management
+  mongo-express:
+    image: mongo-express
+    restart: unless-stopped
+    environment:
+      - ME_CONFIG_MONGODB_SERVER=mongo
+    ports:
+      - "8083:8081"
+    networks:
+      - internal
