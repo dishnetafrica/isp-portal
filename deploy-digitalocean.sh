@@ -1,82 +1,322 @@
-#!/usr/bin/env bash
-set -e
+version: '3.8'
 
-echo "========================================="
-echo "  ISP Portal - Production Deployment     "
-echo "  GoDaddy DNS / UISP Compatible          "
-echo "========================================="
+# ISP Customer Portal - Production Docker Compose
+# Supports: Starlink, MikroTik, TR-069 (D-Link/TP-Link), UISP Integration
 
-INSTALL_DIR="/opt/isp-portal"
-SERVER_IP=$(curl -s ifconfig.me)
+services:
+  # ===========================================
+  # REVERSE PROXY & SSL (Traefik)
+  # ===========================================
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "80:80"
+      - "443:443"
+      - "7547:7547"  # TR-069 CWMP port (external)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
+      - traefik-certificates:/etc/traefik/acme
+    environment:
+      - DO_AUTH_TOKEN=${DO_AUTH_TOKEN}
+    networks:
+      - web
+      - internal
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.${DOMAIN}`)"
+      - "traefik.http.routers.traefik.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.routers.traefik.middlewares=auth"
+      - "traefik.http.middlewares.auth.basicauth.users=${TRAEFIK_USERS}"
 
-# -----------------------------
-# 1. Inputs
-# -----------------------------
-read -p "Enter ROOT domain (example: dishnetafrica.com): " ROOT_DOMAIN
-read -p "Enter UISP CRM URL (example: https://crm.dishnetafrica.com): " UISP_URL
+  # ===========================================
+  # MAIN BACKEND API (FastAPI)
+  # ===========================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: isp-backend
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+      - UISP_URL=${UISP_URL}
+      - UISP_API_KEY=${UISP_API_KEY}
+      - GENIEACS_URL=http://genieacs-nbi:7557
+      - ENVIRONMENT=production
+    volumes:
+      - ./backend:/app
+      - backend-logs:/app/logs
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - internal
+      - web
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.backend.entrypoints=websecure"
+      - "traefik.http.routers.backend.rule=Host(`isp-api.${DOMAIN}`)"
+      - "traefik.http.routers.backend.tls.certresolver=letsencrypt"
+      - "traefik.http.services.backend.loadbalancer.server.port=8000"
+      - "traefik.http.routers.backend.middlewares=api-ratelimit"
+      - "traefik.http.middlewares.api-ratelimit.ratelimit.average=100"
+      - "traefik.http.middlewares.api-ratelimit.ratelimit.burst=50"
 
-PORTAL_DOMAIN="isp.${ROOT_DOMAIN}"
-API_DOMAIN="isp-api.${ROOT_DOMAIN}"
-ACS_DOMAIN="acs.${ROOT_DOMAIN}"
-GRAFANA_DOMAIN="grafana.${ROOT_DOMAIN}"
+  # ===========================================
+  # CELERY WORKER (Background Tasks)
+  # ===========================================
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: celery-worker
+    restart: unless-stopped
+    command: celery -A app.celery worker --loglevel=info --concurrency=4
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+      - UISP_URL=${UISP_URL}
+      - GENIEACS_URL=http://genieacs-nbi:7557
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - postgres
+      - redis
+      - backend
+    networks:
+      - internal
 
-echo ""
-echo "Configuration:"
-echo " Customer Portal : https://${PORTAL_DOMAIN}"
-echo " Backend API     : https://${API_DOMAIN}"
-echo " ACS (TR-069)    : https://${ACS_DOMAIN}"
-echo " Grafana         : https://${GRAFANA_DOMAIN}"
-echo " UISP CRM        : ${UISP_URL}"
-echo " Server IP       : ${SERVER_IP}"
-echo ""
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: celery-beat
+    restart: unless-stopped
+    command: celery -A app.celery beat --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - redis
+      - celery-worker
+    networks:
+      - internal
 
-# -----------------------------
-# 2. System prep
-# -----------------------------
-echo "[1/5] System preparation..."
-apt update -y
-apt install -y curl git ufw ca-certificates docker.io docker-compose-plugin
-systemctl enable docker
-systemctl start docker
+  # ===========================================
+  # DATABASE (PostgreSQL)
+  # ===========================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-# -----------------------------
-# 3. Firewall
-# -----------------------------
-echo "[2/5] Firewall configuration..."
-ufw allow 22/tcp
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw allow 7547/tcp
-ufw allow 7557/tcp
-ufw --force enable
+  # ===========================================
+  # REDIS (Caching & Queue)
+  # ===========================================
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-# -----------------------------
-# 4. Environment validation
-# -----------------------------
-echo "[3/5] Validating environment..."
-if [ ! -f ".env" ]; then
-  echo "ERROR: .env file not found"
-  exit 1
-fi
+   # ===========================================
+  # GENIEACS (ALL-IN-ONE)
+  # ===========================================
+  genieacs:
+    image: drumsergio/genieacs:latest
+    container_name: genieacs
+    restart: unless-stopped
+    environment:
+      - MONGO_URL=mongodb://mongo:27017/genieacs
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - mongo
+      - redis
+    networks:
+      - internal
+      - web
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.genieacs.entrypoints=websecure"
+      - "traefik.http.routers.genieacs.rule=Host(`acs.${DOMAIN}`)"
+      - "traefik.http.routers.genieacs.tls.certresolver=letsencrypt"
+      - "traefik.http.services.genieacs.loadbalancer.server.port=3000"
 
-export PORTAL_DOMAIN API_DOMAIN ACS_DOMAIN GRAFANA_DOMAIN UISP_URL
+  # ===========================================
+  # MONGODB (GenieACS Database)
+  # ===========================================
+  mongo:
+    image: mongo:4.4
+    container_name: mongo
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - internal
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongo localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-# -----------------------------
-# 5. Start services
-# -----------------------------
-echo "[4/5] Starting services..."
-docker compose down || true
-docker compose pull
-docker compose up -d
+  # ===========================================
+  # MONITORING (Prometheus + Grafana)
+  # ===========================================
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - internal
+      - web
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.prometheus.entrypoints=websecure"
+      - "traefik.http.routers.prometheus.rule=Host(`prometheus.${DOMAIN}`)"
+      - "traefik.http.routers.prometheus.tls.certresolver=letsencrypt"
+      - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+      - "traefik.http.routers.prometheus.middlewares=auth"
 
-echo ""
-echo "========================================="
-echo " Deployment completed successfully"
-echo ""
-echo " Portal  : https://${PORTAL_DOMAIN}"
-echo " API     : https://${API_DOMAIN}"
-echo " ACS     : https://${ACS_DOMAIN}"
-echo " Grafana : https://${GRAFANA_DOMAIN}"
-echo "========================================="
+  grafana:
+    image: grafana/grafana:10.1.0
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=https://grafana.${DOMAIN}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    networks:
+      - internal
+      - web
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.${DOMAIN}`)"
+      - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
 
-docker compose ps
+  # ===========================================
+  # LOG MANAGEMENT (Loki)
+  # ===========================================
+  loki:
+    image: grafana/loki:2.9.0
+    container_name: loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./monitoring/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    networks:
+      - internal
+
+  promtail:
+    image: grafana/promtail:2.9.0
+    container_name: promtail
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/log:/var/log:ro
+      - backend-logs:/app/logs:ro
+      - genieacs-logs:/genieacs/logs:ro
+    command: -config.file=/etc/promtail/promtail-config.yml
+    networks:
+      - internal
+
+  # ===========================================
+  # BACKUP SERVICE
+  # ===========================================
+  backup:
+    image: offen/docker-volume-backup:v2
+    container_name: backup
+    restart: unless-stopped
+    environment:
+      - BACKUP_CRON_EXPRESSION=0 3 * * *
+      - BACKUP_FILENAME=isp-portal-backup-%Y-%m-%d.tar.gz
+      - AWS_S3_BUCKET_NAME=${DO_SPACES_BUCKET}
+      - AWS_S3_PATH=backups
+      - AWS_ACCESS_KEY_ID=${DO_SPACES_KEY}
+      - AWS_SECRET_ACCESS_KEY=${DO_SPACES_SECRET}
+      - AWS_ENDPOINT=https://${DO_SPACES_REGION}.digitaloceanspaces.com
+      - BACKUP_RETENTION_DAYS=30
+    volumes:
+      - postgres-data:/backup/postgres:ro
+      - mongo-data:/backup/mongo:ro
+      - redis-data:/backup/redis:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - internal
+
+# ===========================================
+# NETWORKS
+# ===========================================
+networks:
+  web:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true
+
+# ===========================================
+# VOLUMES
+# ===========================================
+volumes:
+  traefik-certificates:
+  postgres-data:
+  redis-data:
+  mongo-data:
+  genieacs-logs:
+  genieacs-files:
+  prometheus-data:
+  grafana-data:
+  loki-data:
+  backend-logs:
