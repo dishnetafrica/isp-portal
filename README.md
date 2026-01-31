@@ -14,7 +14,7 @@ Complete ISP customer portal for managing Starlink, MikroTik, and TR-069 devices
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/isp-portal.git
+git clone https://github.com/dishnetafrica/isp-portal.git
 cd isp-portal
 
 # Run deployment script
